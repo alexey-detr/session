@@ -183,14 +183,15 @@ function session(options){
         return;
       }
 
+      if (headerName) {
+        setHeader(res, headerName, req.sessionID, secret);
+      }
+
       if (!shouldSetCookie(req)) {
         return;
       }
 
       setcookie(res, name, req.sessionID, secret, cookie.data);
-      if (headerName) {
-        setHeader(res, headerName, req.sessionID, secret);
-      }
     });
 
     // proxy end() to commit the session
