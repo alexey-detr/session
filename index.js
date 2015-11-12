@@ -8,6 +8,7 @@
 
 /**
  * Module dependencies.
+ * @private
  */
 
 var cookie = require('cookie');
@@ -45,6 +46,7 @@ exports.MemoryStore = MemoryStore;
 
 /**
  * Warning message for `MemoryStore` usage in production.
+ * @private
  */
 
 var warning = 'Warning: connect.session() MemoryStore is not\n'
@@ -53,6 +55,7 @@ var warning = 'Warning: connect.session() MemoryStore is not\n'
 
 /**
  * Node.js 0.8+ async implementation.
+ * @private
  */
 
 /* istanbul ignore next */
@@ -63,15 +66,19 @@ var defer = typeof setImmediate === 'function'
 /**
  * Setup session store with the given `options`.
  *
- * See README.md for documentation of options and formatting.
- *
- * Session data is _not_ saved in the cookie itself, however cookies are used,
- * so you must use the cookie-parser middleware _before_ `session()`.
- * [https://github.com/expressjs/cookie-parser]
- *
- * @param {Object} options
+ * @param {Object} [options]
+ * @param {Object} [options.cookie] Options for cookie
+ * @param {Function} [options.genid]
+ * @param {String} [options.name=connect.sid] Session ID cookie name
+ * @param {Boolean} [options.proxy]
+ * @param {Boolean} [options.resave] Resave unmodified sessions back to the store
+ * @param {Boolean} [options.rolling] Enable/disable rolling session expiration
+ * @param {Boolean} [options.saveUninitialized] Save uninitialized sessions to the store
+ * @param {String} [options.secret] Secret for signing session ID
+ * @param {Object} [options.store=MemoryStore] Session store
+ * @param {String} [options.unset]
  * @return {Function} middleware
- * @api public
+ * @public
  */
 
 function session(options){
@@ -87,6 +94,7 @@ function session(options){
     , rollingSessions = options.rolling || false;
   var resaveSession = options.resave;
   var saveUninitializedSession = options.saveUninitialized;
+  var isCookieConfigurationSet = options.cookie !== null;
   var headerNameNormalized;
   if (headerName) {
     // lower-case representation of header name to fetch header value from req.headers
@@ -126,9 +134,12 @@ function session(options){
   store.generate = function(req){
     req.sessionID = generateId(req);
     req.session = new Session(req);
-    req.session.cookie = new Cookie(cookie);
+    if (isCookieConfigurationSet) {
+      req.session.cookie = new Cookie(cookie);
+    }
   };
 
+  var storeImplementsTouch = typeof store.touch === 'function';
   store.on('disconnect', function(){ storeReady = false; });
   store.on('connect', function(){ storeReady = true; });
 
@@ -144,9 +155,11 @@ function session(options){
     // the store has temporarily disconnected etc
     if (!storeReady) return debug('store is disconnected'), next();
 
-    // pathname mismatch
-    var originalPath = parseUrl.original(req).pathname;
-    if (0 != originalPath.indexOf(cookie.path || '/')) return next();
+    if (isCookieConfigurationSet) {
+      // pathname mismatch
+      var originalPath = parseUrl.original(req).pathname;
+      if (0 != originalPath.indexOf(cookie.path || '/')) return next();
+    }
 
     // backwards compatibility for signed cookies
     // req.secret is passed from the cookie parser middleware
@@ -162,10 +175,13 @@ function session(options){
     // expose store
     req.sessionStore = store;
 
-    // get the session ID from the cookie
-    var cookieId = req.sessionID = getcookie(req, name, secret);
-    // if not trying to get session ID from header
-    if (!cookieId && headerName) {
+    var cookieId;
+    if (isCookieConfigurationSet) {
+      // get the session ID from the cookie
+      cookieId = req.sessionID = getcookie(req, name, secret);
+    }
+    if (headerName) {
+      // get the session ID from the header
       cookieId = req.sessionID = getHeader(req, headerNameNormalized, secret);
     }
 
@@ -176,23 +192,22 @@ function session(options){
         return;
       }
 
-      var cookie = req.session.cookie;
-
-      // only send secure cookies via https
-      if (cookie.secure && !issecure(req, trustProxy)) {
-        debug('not secured');
-        return;
-      }
-
       if (headerName) {
         setHeader(res, headerName, req.sessionID, secret);
       }
 
-      if (!shouldSetCookie(req)) {
-        return;
+      if (isCookieConfigurationSet) {
+        var cookie = req.session.cookie;
+        // only send secure cookies via https
+        if (cookie.secure && !issecure(req, trustProxy)) {
+          debug('not secured');
+          return;
+        }
+        if (!shouldSetCookie(req)) {
+          return;
+        }
+        setcookie(res, name, req.sessionID, secret, cookie.data);
       }
-
-      setcookie(res, name, req.sessionID, secret, cookie.data);
     });
 
     // proxy end() to commit the session
@@ -209,10 +224,6 @@ function session(options){
       var ret;
       var sync = true;
 
-      if (chunk == null) {
-        chunk = '';
-      }
-
       function writeend() {
         if (sync) {
           ret = _end.call(res, chunk, encoding);
@@ -225,6 +236,11 @@ function session(options){
 
       function writetop() {
         if (!sync) {
+          return ret;
+        }
+
+        if (chunk == null) {
+          ret = true;
           return ret;
         }
 
@@ -285,6 +301,19 @@ function session(options){
         });
 
         return writetop();
+      } else if (storeImplementsTouch && shouldTouch(req)) {
+        // store implements touch method
+        debug('touching');
+        store.touch(req.sessionID, req.session, function ontouch(err) {
+          if (err) {
+            defer(next, err);
+          }
+
+          debug('touched');
+          writeend();
+        });
+
+        return writetop();
       }
 
       return _end.call(res, chunk, encoding);
@@ -333,13 +362,35 @@ function session(options){
 
     // determine if session should be saved to store
     function shouldSave(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        debug('session ignored because of bogus req.sessionID %o', req.sessionID);
+        return false;
+      }
+
       return !saveUninitializedSession && cookieId !== req.sessionID
         ? isModified(req.session)
         : !isSaved(req.session)
     }
 
+    // determine if session should be touched
+    function shouldTouch(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        debug('session ignored because of bogus req.sessionID %o', req.sessionID);
+        return false;
+      }
+
+      return cookieId === req.sessionID && !shouldSave(req);
+    }
+
     // determine if cookie should be set on response
     function shouldSetCookie(req) {
+      // cannot set cookie without a session ID
+      if (typeof req.sessionID !== 'string') {
+        return false;
+      }
+
       // in case of rolling session, always reset the cookie
       if (rollingSessions) {
         return true;
@@ -398,7 +449,7 @@ function session(options){
  * Generate a session ID for a new session.
  *
  * @return {String}
- * @api private
+ * @private
  */
 
 function generateSessionId(sess) {
@@ -409,7 +460,7 @@ function generateSessionId(sess) {
  * Get the session ID cookie from request.
  *
  * @return {string}
- * @api private
+ * @private
  */
 
 function getcookie(req, name, secret) {
@@ -476,7 +527,7 @@ function getcookie(req, name, secret) {
  *
  * @param {Object} sess
  * @return {String}
- * @api private
+ * @private
  */
 
 function hash(sess) {
@@ -493,7 +544,7 @@ function hash(sess) {
  * @param {Object} req
  * @param {Boolean} [trustProxy]
  * @return {Boolean}
- * @api private
+ * @private
  */
 
 function issecure(req, trustProxy) {
@@ -524,6 +575,12 @@ function issecure(req, trustProxy) {
 
   return proto === 'https';
 }
+
+/**
+ * Set cookie on response.
+ *
+ * @private
+ */
 
 function setcookie(res, name, val, secret, options) {
   var signed = 's:' + signature.sign(val, secret);
